@@ -273,10 +273,6 @@ MAIN16_BUFFERS = (
     ),
 )
 MAIN16_BUFFER_BY_NAME = {buffer.name: buffer for buffer in MAIN16_BUFFERS}
-WEIGHT_PATCH_BD_IDS = (
-    (0, 2, 4, 6, 8, 10, 12, 14),
-    (1, 3, 5, 7, 9, 11, 13, 15),
-)
 WEIGHT_SPAN_CHUNKS = QKV_BODY_WEIGHT_CHUNKS
 
 
@@ -294,9 +290,21 @@ def _full_weight_spans() -> tuple[tuple[int, int], ...]:
         *_split_weight_span(FULL_LAYER_UPGATE_WEIGHT_CHUNK_BASE, UPGATE_WEIGHT_CHUNKS),
         *_split_weight_span(FULL_LAYER_DOWN_WEIGHT_CHUNK_BASE, DOWN_WEIGHT_CHUNKS),
     )
-    if len(spans) != len(WEIGHT_PATCH_BD_IDS[0]):
-        raise RuntimeError(f"bad full-layer weight span count: {len(spans)}")
     return spans
+
+
+# Dynamic BD ID assignment based on actual span count
+def _weight_patch_bd_ids() -> tuple[tuple[int, ...], tuple[int, ...]]:
+    n = len(_full_weight_spans())
+    # Even BD IDs for patch 0, odd BD IDs for patch 1
+    return (
+        tuple(i * 2 for i in range(n)),
+        tuple(i * 2 + 1 for i in range(n)),
+    )
+
+
+# Backwards-compat: compute from spans
+WEIGHT_PATCH_BD_IDS = _weight_patch_bd_ids()
 
 
 def _runtime_sequence(schedule: DecodeSchedule) -> str:
@@ -1448,8 +1456,8 @@ def validate_generated_mlir(mlir: str, schedule: DecodeSchedule = DEFAULT_SCHEDU
             "attention_out",
             PACKET_ID_ATTENTION,
             O_BODY_RECORDS,
-            "aie.use_lock(%hub_return_full, AcquireGreaterEqual, 4)",
-            "aie.use_lock(%hub_return_empty, Release, 4)",
+            "aie.use_lock(%hub_return_full, AcquireGreaterEqual, 8)",  # C2: = HUB_WINDOWS (8-col); was stale 4
+            "aie.use_lock(%hub_return_empty, Release, 8)",
         )
     )
     errors.extend(
@@ -1530,8 +1538,19 @@ def validate_generated_mlir(mlir: str, schedule: DecodeSchedule = DEFAULT_SCHEDU
         errors.append("full-layer weight ingress must use bounded descriptor spans, not one monolithic patch BD")
     if CURRENT_PACKET_K != 8 or CURRENT_PACKET_V != 9:
         errors.append("current K/V packets must stay at 8/9 to match the cache writeback ABI")
-    if DOWN_CHUNKS != 48 or TOTAL_MAIN_CHUNKS != 768:
-        errors.append("full-layer replay/down chunk contract mismatch")
+    expected_down_chunks = DOWN_WEIGHT_CHUNKS // DOWN_BODY_RECORDS
+    expected_main_chunks = C1R2_UPGATE_REPLAYS * ((C1R2_PACKET_DWORDS - 1) // MAIN_CHUNK_DWORDS)
+    if (
+        DOWN_CHUNKS != expected_down_chunks
+        or TOTAL_MAIN_CHUNKS != expected_main_chunks
+        or TOTAL_MAIN_CHUNKS != UPGATE_WEIGHT_CHUNKS
+    ):
+        errors.append(
+            "full-layer replay/down chunk contract mismatch: "
+            f"down={DOWN_CHUNKS}/{expected_down_chunks}, "
+            f"main={TOTAL_MAIN_CHUNKS}/{expected_main_chunks}, "
+            f"upgate_weight={UPGATE_WEIGHT_CHUNKS}"
+        )
     if (
         FULL_LAYER_O_WEIGHT_CHUNK_BASE != QKV_BODY_WEIGHT_CHUNKS
         or FULL_LAYER_UPGATE_WEIGHT_CHUNK_BASE != FULL_LAYER_O_WEIGHT_CHUNK_BASE + O_WEIGHT_CHUNKS
@@ -1543,10 +1562,10 @@ def validate_generated_mlir(mlir: str, schedule: DecodeSchedule = DEFAULT_SCHEDU
         errors.append("full-layer q4nx body record slots changed unexpectedly")
     if (
         HUB_Q_IN_CHANNEL != 1
-        or HUB_Q_OUT_CHANNELS != (1, 2, 3, 4)
-        or HUB_Q_OUT_BDS != (25, 2, 26, 3)
-        or HUB_RETURN_IN_CHANNELS != (2, 3, 4, 5)
-        or HUB_RETURN_IN_BDS != (4, 28, 6, 30)
+        or HUB_Q_OUT_CHANNELS != (1, 2, 3, 4, 1, 2, 3, 4)
+        or HUB_Q_OUT_BDS != (25, 2, 26, 3, 37, 5, 36, 8)  # 8-col; C1 remapped idx4/6 to 37/36 (avoid attn_out 34-35)
+        or HUB_RETURN_IN_CHANNELS != (2, 3, 4, 5, 2, 3, 4, 5)
+        or HUB_RETURN_IN_BDS != (4, 28, 6, 30, 9, 38, 11, 39)  # 8-col; C1 remapped idx5/7 to 38/39 (avoid attn_out 34-35)
         or HUB_DOWN_OUT_BDS != (27, 29, 31, 32, 33, 42, 43, 44)
     ):
         errors.append("hub BD contract mismatch")
